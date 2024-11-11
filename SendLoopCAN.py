@@ -3,13 +3,13 @@ import time
 
 # Configure the CAN BUS
 can_interface = 'pican1'
-bus = can.interface.Bus(can_interface, bustype='socketcan')
+bus = can.interface.Bus(can_interface, interface='socketcan')
 
 # Configure the Message  to be sent
 msg = can.Message(arbitration_id=0x123, data=[0x11]*8, is_extended_id=False)
 
 # Send Send_Frames messages in Send_Time secconds
-Send_Frames     = 3000
+Send_Frames     = 2500
 Send_Time       = 1
 # As indication. in a 250 KBaud BUS, we can theoretically send ~ 2293 frames/second
 Send_delay = (Send_Time/Send_Frames)*0.8    #There is some delay introduced already on the sending, so we reduce the extra delay by approx 80%
