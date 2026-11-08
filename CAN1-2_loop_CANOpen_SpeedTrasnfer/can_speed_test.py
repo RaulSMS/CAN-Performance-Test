@@ -39,6 +39,7 @@ import multiprocessing as mp
 import os
 import shutil
 import socket
+import statistics
 import struct
 import subprocess
 import time
@@ -124,7 +125,7 @@ def setup_interfaces(args, bitrate):
 # ================================================================ background load
 def _bg_worker(interface, channel, can_id, fps, stop, out):
     bus = can.Bus(interface=interface, channel=channel)
-    period, credit, sent = 0.005, 0.0, 0
+    period, credit, sent = 0.001, 0.0, 0
     # random payload: all-zero data would force maximum bit stuffing and distort the load %
     msg = can.Message(arbitration_id=can_id, is_extended_id=False, data=os.urandom(8))
     t0 = nxt = time.perf_counter()
@@ -165,6 +166,37 @@ class BackgroundLoad:
             self.actual_pct = 100 * self.out.get(timeout=5) / theoretical_fps(self.bitrate)
             self.proc.join()
             print(f"  background load: target {self.pct} %, achieved ~{self.actual_pct:.1f} %")
+
+
+# ================================================================ bus log (candump)
+class CandumpLog:
+    """Record bus traffic with candump while a scenario runs (at most --candump-seconds).
+
+    Logs on --a only: thanks to SocketCAN local loopback, a socket on pican1 sees every frame
+    on the bus, both pican1's own and the ones from pican2. Proof that the test traffic is real.
+    """
+
+    def __init__(self, args, bitrate, load, scenario):
+        self.args, self.proc = args, None
+        if args.candump_dir:
+            name = f"{bitrate // 1000}k_load{load:02d}_{scenario.lower().replace(' ', '_')}.log"
+            self.path = os.path.join(args.candump_dir, name)
+
+    def __enter__(self):
+        if self.args.candump_dir:
+            self.f = open(self.path, "w")
+            self.proc = subprocess.Popen(["nice", "-n", "19", "timeout", "-s", "INT", str(self.args.candump_seconds),
+                                          "candump", "-ta", self.args.a],
+                                         stdout=self.f, stderr=subprocess.STDOUT)
+            time.sleep(0.2)  # let candump bind before traffic starts
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc:
+            if self.proc.poll() is None:
+                self.proc.send_signal(2)  # SIGINT -> candump flushes and exits
+            self.proc.wait(timeout=5)
+            self.f.close()
 
 
 # ================================================================ raw CAN
@@ -330,11 +362,15 @@ def run_sdo(args, bitrate, load):
     srv_net = server = None
     if not args.no_local_server:
         srv_net = canopen.Network()
-        srv_net.connect(interface=args.interface, channel=args.a)
+        # kernel filter: only SDO requests reach Python. Otherwise every background frame is
+        # handled in Python too, and at 1 Mbit/s + high load the SDO replies arrive too late.
+        srv_net.connect(interface=args.interface, channel=args.a,
+                        can_filters=[{"can_id": 0x600 + args.node, "can_mask": 0x7FF, "extended": False}])
         server = canopen.LocalNode(args.node, make_domain_od(args.index, args.sub))
         srv_net.add_node(server)
     cli_net = canopen.Network()
-    cli_net.connect(interface=args.interface, channel=args.b)
+    cli_net.connect(interface=args.interface, channel=args.b,
+                    can_filters=[{"can_id": 0x580 + args.node, "can_mask": 0x7FF, "extended": False}])
     client = cli_net.add_node(args.node, None)
     client.sdo.RESPONSE_TIMEOUT = args.timeout
     rows = []
@@ -372,10 +408,12 @@ def run_sdo(args, bitrate, load):
                 if not times:
                     print(f"  SDO {direction} {size} B failed: {err}")
                     continue
-                avg = sum(times) / len(times)
-                note = f"{len(times)}/{args.repeat} runs" + (f", {err}" if err else "") + \
+                avg = statistics.median(times)  # median: one slow run (Pi scheduling) must not skew it
+                note = f"median of {len(times)}/{args.repeat} runs, {size / max(times) / 1024:.2f}-" \
+                       f"{size / min(times) / 1024:.2f} KiB/s" + (f", {err}" if err else "") + \
                        ("" if server else ", external server (not verified)")
-                row = make_row(args, bitrate, load, f"SDO {args.sdo_mode}", direction, size, avg, ok, note)
+                mode = args.sdo_mode if args.sdo_mode != "auto" else ("expedited" if size <= 4 else "segmented")
+                row = make_row(args, bitrate, load, f"SDO {mode}", direction, size, avg, ok, note)
                 print_row(row)
                 rows.append(row)
     finally:
@@ -430,30 +468,43 @@ def main():
     g.add_argument("--sample-point", type=float, help="e.g. 0.875")
     g.add_argument("--txqueuelen", type=int, default=1000)
     g = p.add_argument_group("raw")
-    g.add_argument("--raw-seconds", type=float, default=5.0, help="approx. duration of each raw test")
+    g.add_argument("--raw-seconds", type=float, default=3.0, help="approx. duration of each raw test")
     g.add_argument("--frames", type=int, help="fixed frame count instead of --raw-seconds")
     g.add_argument("--can-id", type=lambda x: int(x, 0), default=0x100)
-    g.add_argument("--idle", type=float, default=1.0)
+    g.add_argument("--idle", type=float, default=0.5, help="raw rx: stop after this many s without frames")
     g.add_argument("--duplex", action="store_true", help="raw test: also run duplex")
     g = p.add_argument_group("block transfer estimate (calculated from measured raw simplex)")
-    g.add_argument("--block-sizes", type=int_list, default=[127, 32],
-                   help="SDO block sizes in frames (1..127), e.g. 127,32")
+    g.add_argument("--block-sizes", type=int_list, default=[127, 32, 16],
+                   help="SDO block sizes in frames (1..127), e.g. 127,32,16")
     g.add_argument("--turnaround-ms", type=float, default=2.0,
                    help="receiver ack delay per block in ms (Pi ~1-2, ECU writing flash: much more)")
     g = p.add_argument_group("sdo")
     g.add_argument("--node", type=int, default=5)
     g.add_argument("--index", type=lambda x: int(x, 0), default=0x2000)
     g.add_argument("--sub", type=int, default=0)
-    g.add_argument("--sizes", type=int_list, default=[4, 256, 4096])
-    g.add_argument("--directions", type=lambda s: s.split(","), default=["upload", "download"])
+    g.add_argument("--sizes", type=int_list, default=[4096],
+                   help="SDO transfer sizes in bytes; throughput is steady from ~4 KB on")
+    g.add_argument("--directions", type=lambda s: s.split(","), default=["download"],
+                   help="download = client writes to server (TCU -> ECU, like a firmware download); upload,download for both")
     g.add_argument("--sdo-mode", choices=["auto", "segmented", "block"], default="auto")
     g.add_argument("--repeat", type=int, default=3)
     g.add_argument("--timeout", type=float, default=1.0)
     g.add_argument("--no-local-server", action="store_true")
+    g = p.add_argument_group("bus log")
+    g.add_argument("--candump-dir", default="candump_logs",
+                   help="write a candump log per measured scenario to <dir>/<run time>/ ('' = off)")
+    g.add_argument("--candump-seconds", type=float, default=10.0, help="max log length per scenario")
     args = p.parse_args()
     if args.sdo_mode == "block" and not args.no_local_server:
         p.error("python-canopen's local server has no block transfer; use --no-local-server with an external server")
     setup = not args.no_setup and args.interface == "socketcan"
+    if args.candump_dir and (args.interface != "socketcan" or not shutil.which("candump")):
+        print("  candump logs disabled (needs socketcan and can-utils)")
+        args.candump_dir = ""
+    if args.candump_dir and args.test != "setup":
+        args.candump_dir = os.path.join(args.candump_dir, time.strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(args.candump_dir, exist_ok=True)
+        print(f"  candump logs: {args.candump_dir}/")
 
     if args.test == "setup":
         setup_interfaces(args, args.bitrates[0])
@@ -470,11 +521,14 @@ def main():
                                  note="calculated, 8 B frames"))
             with BackgroundLoad(args, bitrate, load) as bg:
                 if args.test in ("raw", "all"):
-                    rows += run_raw(args, bitrate, load, duplex=False)
+                    with CandumpLog(args, bitrate, load, "raw simplex"):
+                        rows += run_raw(args, bitrate, load, duplex=False)
                     if args.duplex:
-                        rows += run_raw(args, bitrate, load, duplex=True)
+                        with CandumpLog(args, bitrate, load, "raw duplex"):
+                            rows += run_raw(args, bitrate, load, duplex=True)
                 if args.test in ("sdo", "all"):
-                    rows += run_sdo(args, bitrate, load)
+                    with CandumpLog(args, bitrate, load, "sdo"):
+                        rows += run_sdo(args, bitrate, load)
         if setup:
             for name in (args.a, args.b):
                 print(f"  {name} after tests: {iface_info(name)}")

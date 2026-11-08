@@ -18,7 +18,7 @@ Dependencies: `pip install python-can` (plus `canopen` for the CANopen tool, `ca
 
 - `local-can-performance-test.py`: original single-interface send benchmark. Sends N frames with a 2-byte counter in the last two payload bytes and reports msgs/s, inter-message time and estimated bus load. The README holds its reference results (cansend about 350 msg/s; python-can SocketCAN reaches about 96–98 % bus load).
 - `test_feedback.py`: pican1 → pican2 loopback throughput and loss test.
-- `CAN1-2_loop_CANOpen_SpeedTrasnfer/can_speed_test.py`: the most complete tool. It sweeps bitrates and background bus loads across theoretical, raw simplex/duplex and CANopen SDO scenarios. **Its README has detailed developer notes (code structure, conventions, how to test without hardware). Read it before changing that script.** Key rules from it:
+- `CAN1-2_loop_CANOpen_SpeedTrasnfer/can_speed_test.py`: the most complete tool. It sweeps bitrates and background bus loads across theoretical, raw simplex/duplex and CANopen SDO scenarios. **Its README has detailed developer notes (code structure, conventions, how to test without hardware). Read it before changing that script.** `make_results.py` next to it turns a run's CSV + candump logs into the shareable `results.md`; its explanatory text contains percent ranges taken from the measured data, so re-check them after new runs. Key rules from it:
   - Keep **min/MB** (MB = 1,000,000 bytes) as the headline KPI.
   - Every result row must be built with `make_row()` so it appears in both the summary and the CSV.
   - Raw TX/RX workers run in separate `multiprocessing` processes to avoid the GIL.

@@ -38,8 +38,8 @@ pip install python-can canopen
 # Only raw CAN, including duplex
 ./can_speed_test.py raw --bitrates 250000 --duplex
 
-# Only SDO, larger transfers
-./can_speed_test.py sdo --bitrates 250000 --sizes 4096,65536 --repeat 3
+# Only SDO, both directions, larger transfers
+./can_speed_test.py sdo --bitrates 250000 --directions upload,download --sizes 4096,65536
 
 # Interfaces already configured by hand: do not touch them
 ./can_speed_test.py all --no-setup --bitrates 500000
@@ -60,13 +60,14 @@ Run `./can_speed_test.py -h` for all options.
 | `--csv` | – | Append all result rows to a CSV file |
 | `--no-setup` | off | Do not run any `ip link` commands |
 | `--restart-ms`, `--sample-point`, `--txqueuelen` | `100`, –, `1000` | Interface settings |
-| `--raw-seconds` / `--frames` | `5` / – | Duration (or fixed frame count) of each raw test |
-| `--sizes` | `4,256,4096` | SDO transfer sizes in bytes |
-| `--directions` | `upload,download` | SDO directions |
+| `--raw-seconds` / `--frames` | `3` / – | Duration (or fixed frame count) of each raw test |
+| `--sizes` | `4096` | SDO transfer sizes in bytes. Throughput is already steady at 4 KB (64 KB gives the same KiB/s) |
+| `--directions` | `download` | SDO directions. `download` = client writes to the server (TCU → ECU, like a firmware download). Upload measured the same speed |
 | `--sdo-mode` | `auto` | `auto`, `segmented` or `block` (block needs an external server) |
 | `--node`, `--index`, `--sub` | `5`, `0x2000`, `0` | SDO target object |
-| `--block-sizes` | `127,32` | Block sizes (frames) for the calculated block estimate |
+| `--block-sizes` | `127,32,16` | Block sizes (frames) for the calculated block estimate |
 | `--turnaround-ms` | `2` | Receiver ack delay per block for the estimate. Use a larger value to model an ECU writing flash |
+| `--candump-dir` / `--candump-seconds` | `candump_logs` / `10` | Bus log per measured scenario (`''` = off), see Output |
 | `--no-local-server` | off | Test against an external CANopen node instead of the built-in one |
 
 ---
@@ -81,7 +82,7 @@ For every bitrate × background load combination:
 | **Raw simplex** | `pican1 → pican2` back-to-back frames, no handshake. Best case for any protocol. |
 | **Block est.** | Calculated, not measured. SDO block transfer derived from the measured raw simplex frame time: per block of B frames, B×7 data bytes take (B+1) frame times (segments + ack) plus `--turnaround-ms`. With 0 ms turnaround this is raw × 7/8 × B/(B+1). Because it uses the measured frame time, stuffing and background load are included. |
 | **Raw duplex** | Optional, only with `--duplex`. Both directions at the same time. The lower ID wins arbitration, so the streams run mostly one after the other; both directions are timed over the shared window. |
-| **SDO upload / download** | Standard CANopen SDO (expedited ≤ 4 B, segmented above). Every transfer is verified byte for byte. |
+| **SDO segmented / expedited** | Standard CANopen SDO (expedited ≤ 4 B, segmented above), download by default. Every transfer is verified byte for byte. Both canopen networks use kernel filters for their SDO IDs only, so background frames don't slow down the Python side. |
 | **Background load** | A separate process sends filler frames from `pican2` at a target % of bus capacity, with an ID that wins arbitration over SDO. This simulates machine traffic already on the bus. The achieved load is printed. |
 
 ## Output
@@ -89,7 +90,17 @@ For every bitrate × background load combination:
 1. Per-test lines while running: KiB/s, min/MB, OK/ERR, plus notes (lost frames, out-of-order frames, TX queue retries, SDO errors).
 2. Interface state after each bitrate (error state, bus-off restarts, error counters) read from `ip -details -statistics -json`.
 3. A **summary table** per bitrate / load / scenario / direction with KiB/s, min/MB and the estimated time for `--file-mb`. For SDO the summary uses the largest tested size, since that represents steady-state throughput.
-4. Optional CSV with columns: `timestamp, file_MB, bitrate, bg_load_pct, scenario, direction, size_B, seconds, KiB_s, min_per_MB, est_file_min, ok, note`.
+4. A `candump -ta` log on `--a` for each measured scenario (raw simplex, raw duplex, SDO), at most `--candump-seconds` long, in `candump_logs/<run time>/<bitrate>k_load<pct>_<scenario>.log`. Through SocketCAN local loopback, pican1 sees all bus frames (its own and pican2's), so the log shows the real test traffic: raw `0x100` with the sequence number in bytes 0–3, background `0x050`, SDO `0x600+node` / `0x580+node`. At 1 Mbit/s with high load candump adds CPU load, which can cause a few dropped frames in the Pi raw receiver (the block estimate uses the bus rate, so it is not affected). Logs are a few MB each at 1 Mbit/s.
+5. Optional CSV with columns: `timestamp, file_MB, bitrate, bg_load_pct, scenario, direction, size_B, seconds, KiB_s, min_per_MB, est_file_min, ok, note`.
+
+### Shareable report: `make_results.py`
+
+`python3 make_results.py results.csv -o results.md` turns the newest run in a CSV into a
+self-explanatory Markdown report: setup, what each test does, 100 MB summary tables, per-bitrate
+details with 1 MB / 100 MB times, interpretation, and frame counts per CAN ID from the run's
+candump logs (newest folder in `candump_logs/` by default, `--logs ''` to skip). The text
+statements in it (percent ranges etc.) were written for the 2026-11-08 run; check them against
+new data.
 
 ## Interpreting the results
 
@@ -107,7 +118,8 @@ For every bitrate × background load combination:
 - **No block transfer with the built-in server.** python-canopen's `SdoServer` (used by `LocalNode`) aborts block upload and download. To test block mode, run an external server on `pican1`, e.g. [CANopenLinux](https://github.com/CANopenNode/CANopenLinux) (CANopenNode on SocketCAN) or a real ECU, then use `--no-local-server --sdo-mode block`.
 - **No CAN FD.** Only classic CAN, 8-byte frames, standard 11-bit IDs.
 - **Theoretical frame size** is 44 + 8·DLC bits + 3 bits interframe space, without stuff bits, so it is an upper bound. Background load % is relative to the same frame rate.
-- **Background load pacing** sends small bursts every 5 ms, which is an approximation of evenly spread traffic.
+- **Background load pacing** sends small bursts every 1 ms, an approximation of evenly spread traffic. (With 5 ms bursts each SDO round trip had to wait behind a whole burst, which made SDO under load too slow, especially at 125–250 kbit/s.)
+- **SDO timing noise on the Pi:** each CAN frame costs SPI interrupt work for the MCP2515 boards, which competes with the Python SDO round trips. Single runs vary by about ±20 %, so SDO reports the **median** of `--repeat` runs (default 3) with the min–max range in the note. candump runs at `nice 19` (costs SDO about 3 %, without nice 10–17 %).
 - **Test status:** run on the real hardware (pican1 + pican2) at 250 kbit/s with 0/30/60 % background load, using `--no-setup`. Other bitrates need the built-in `ip link` setup (sudo).
 
 ## Roadmap / ideas
