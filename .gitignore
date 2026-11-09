@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+CAN1-2_loop_CANOpen_SpeedTrasnfer/candump_logs/
+CAN1-2_loop_CANOpen_SpeedTrasnfer/*.csv
+CAN1-2_loop_CANOpen_SpeedTrasnfer/*.log
